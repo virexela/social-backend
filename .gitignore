@@ -1,1 +1,17 @@
 /target
+.env.local
+Cargo.lock
+
+# Environment files
+.env*
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
