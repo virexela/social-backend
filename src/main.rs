@@ -409,9 +409,70 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, conn_id: Uuid, state: 
             break;
         }
 
-        let req: ClientRequest = match bincode::deserialize(&frame) {
-            Ok(r) => r,
-            Err(_) => {
+        // Decode envelope: [opcode:1][payload_len:4 LE][payload:bytes]
+        if frame.len() < 5 {
+            response_jitter(&state.config).await;
+            let _ = send_resp(&mut socket, privacy_error()).await;
+            continue;
+        }
+        let opcode = frame[0];
+        let payload_len = u32::from_le_bytes(frame[1..5].try_into().unwrap_or([0; 4])) as usize;
+        if frame.len() != 5 + payload_len {
+            response_jitter(&state.config).await;
+            let _ = send_resp(&mut socket, privacy_error()).await;
+            continue;
+        }
+        let payload = &frame[5..];
+
+        let req = match opcode {
+            1 => {
+                // PutMessage: payload = mailbox_id(32) + ciphertext_blob
+                if payload.len() < 32 {
+                    response_jitter(&state.config).await;
+                    let _ = send_resp(&mut socket, privacy_error()).await;
+                    continue;
+                }
+                let mailbox_id = payload[0..32].try_into().unwrap_or([0; 32]);
+                let ciphertext = payload[32..].to_vec();
+                // Generate message ID and use default TTL
+                let message_id = rand::random::<[u8; 16]>();
+                let ttl = MAX_MESSAGE_TTL_SECS;
+                ClientRequest::PutMessage { mailbox_id, message_id, ciphertext, ttl }
+            },
+            2 => {
+                // FetchMessages: payload = mailbox_id(32)
+                if payload.len() != 32 {
+                    response_jitter(&state.config).await;
+                    let _ = send_resp(&mut socket, privacy_error()).await;
+                    continue;
+                }
+                let mailbox_id = payload.try_into().unwrap_or([0; 32]);
+                let limit = DEFAULT_FETCH_LIMIT;
+                ClientRequest::FetchMessages { mailbox_id, limit }
+            },
+            3 => {
+                // DeleteMessages: payload = mailbox_id(32) + [len(4) + id(len)]...
+                if payload.len() < 32 {
+                    response_jitter(&state.config).await;
+                    let _ = send_resp(&mut socket, privacy_error()).await;
+                    continue;
+                }
+                let mailbox_id = payload[0..32].try_into().unwrap_or([0; 32]);
+                let mut message_ids = Vec::new();
+                let mut offset = 32;
+                while offset + 4 <= payload.len() {
+                    let id_len = u32::from_le_bytes(payload[offset..offset+4].try_into().unwrap_or([0; 4])) as usize;
+                    offset += 4;
+                    if offset + id_len > payload.len() || id_len != 16 {
+                        break;
+                    }
+                    let message_id = payload[offset..offset+id_len].try_into().unwrap_or([0; 16]);
+                    message_ids.push(message_id);
+                    offset += id_len;
+                }
+                ClientRequest::DeleteMessages { mailbox_id, message_ids }
+            },
+            _ => {
                 response_jitter(&state.config).await;
                 let _ = send_resp(&mut socket, privacy_error()).await;
                 continue;
@@ -430,8 +491,26 @@ async fn handle_socket(mut socket: WebSocket, ip: IpAddr, conn_id: Uuid, state: 
         };
 
         response_jitter(&state.config).await;
-        if send_resp(&mut socket, resp).await.is_err() {
-            break;
+        
+        // Send envelope-encoded response
+        match resp {
+            ServerResponse::Messages { messages } => {
+                // Send each message as opcode 2 with ciphertext as payload
+                for message in messages {
+                    if !message.ciphertext.is_empty() {
+                        let envelope = encode_envelope(2, &message.ciphertext);
+                        if let Err(_) = send_envelope(&mut socket, &envelope).await {
+                            break;
+                        }
+                    }
+                }
+            },
+            _ => {
+                // For other responses, send as bincode for now (frontend might not handle them)
+                if let Err(_) = send_resp(&mut socket, resp).await {
+                    break;
+                }
+            }
         }
     }
 
@@ -632,6 +711,18 @@ async fn response_jitter(config: &Config) {
 async fn send_resp(socket: &mut WebSocket, resp: ServerResponse) -> Result<(), ()> {
     let bytes = bincode::serialize(&resp).map_err(|_| ())?;
     socket.send(Message::Binary(bytes)).await.map_err(|_| ())
+}
+
+fn encode_envelope(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut envelope = Vec::with_capacity(5 + payload.len());
+    envelope.push(opcode);
+    envelope.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    envelope.extend_from_slice(payload);
+    envelope
+}
+
+async fn send_envelope(socket: &mut WebSocket, envelope: &[u8]) -> Result<(), ()> {
+    socket.send(Message::Binary(envelope.to_vec())).await.map_err(|_| ())
 }
 
 fn bson_bin_16(v: [u8; 16]) -> Binary {
