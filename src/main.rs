@@ -227,10 +227,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:3000".to_string())
-        .parse()
-        .context("BIND_ADDR must be a valid SocketAddr")?;
+    let bind_addr: SocketAddr = match std::env::var("BIND_ADDR") {
+        Ok(addr) => addr
+            .parse()
+            .context("BIND_ADDR must be a valid SocketAddr")?,
+        Err(_) => {
+            let port = std::env::var("PORT")
+                .ok()
+                .or_else(|| std::env::var("WEBSITES_PORT").ok());
+
+            if let Some(port) = port {
+                let port: u16 = port.parse().context("PORT/WEBSITES_PORT must be a valid u16")?;
+                SocketAddr::from(([0, 0, 0, 0], port))
+            } else {
+                "0.0.0.0:3000"
+                    .parse()
+                    .expect("default bind addr must parse")
+            }
+        }
+    };
 
     let mongo_uri = std::env::var("MONGODB_URI").context("MONGODB_URI is required")?;
     let db_name = std::env::var("DB_NAME").unwrap_or_else(|_| "social".to_string());
