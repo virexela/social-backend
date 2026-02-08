@@ -35,15 +35,12 @@ jobs:
         uses: azure/container-apps-deploy-action@v2
         with:
           appSourcePath: ${{ github.workspace }}
-          _dockerfilePathKey_: _dockerfilePath_
-          _targetLabelKey_: _targetLabel_
           registryUrl: socialacr26001.azurecr.io
           registryUsername: ${{ secrets.SOCIAL_REGISTRY_USERNAME }}
           registryPassword: ${{ secrets.SOCIAL_REGISTRY_PASSWORD }}
           containerAppName: social
           resourceGroup: social-rg
           imageToBuild: socialacr26001.azurecr.io/social:${{ github.sha }}
-          _buildArgumentsKey_: |
-            _buildArgumentsValues_
+          dockerfilePath: ./Dockerfile
 
 
