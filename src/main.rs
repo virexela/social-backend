@@ -9,13 +9,14 @@ use anyhow::Context;
 use axum::{
     extract::{
         connect_info::ConnectInfo,
+        Path,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
+    http::{Method, StatusCode},
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -36,7 +37,10 @@ use mongodb::{
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -56,11 +60,42 @@ const DEFAULT_MAX_CONCURRENT_FETCH_PER_IP: usize = 4;
 const DEFAULT_JITTER_MIN_MS: u64 = 5;
 const DEFAULT_JITTER_MAX_MS: u64 = 25;
 
+fn load_env_file(path: &str) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key_raw, value_raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        let key = key_raw.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+
+        let mut value = value_raw.trim().to_string();
+        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+            value = value[1..value.len() - 1].to_string();
+        }
+        // Safe here: called at process startup before any threads spawn.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     mailbox_messages: Collection<Document>,
     mailbox_activity: Collection<Document>,
     prekeys: Collection<Document>,
+    sync_state: Collection<Document>,
     rate_limits: Arc<IpRateLimiter>,
     fetch_limits: Arc<DashMap<IpAddr, Arc<Semaphore>>>,
     metrics: Arc<Metrics>,
@@ -218,8 +253,32 @@ struct FetchedMessage {
     ttl: i64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SyncUpsertRequest {
+    social_id: String,
+    account_blob_b64u: Option<String>,
+    contacts_blob_b64u: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncUpsertResponse {
+    ok: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncGetResponse {
+    social_id: String,
+    account_blob_b64u: Option<String>,
+    contacts_blob_b64u: Option<String>,
+    updated_at: i64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load local env files for dev convenience.
+    load_env_file(".env.local");
+    load_env_file(".env");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -256,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
     let mailbox_messages = db.collection::<Document>("mailbox_messages");
     let mailbox_activity = db.collection::<Document>("mailbox_activity");
     let prekeys = db.collection::<Document>("prekey_bundles");
+    let sync_state = db.collection::<Document>("account_sync");
 
     ensure_indexes(&mailbox_messages, &mailbox_activity, &prekeys).await?;
 
@@ -266,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         mailbox_messages,
         mailbox_activity,
         prekeys,
+        sync_state,
         rate_limits: Arc::new(IpRateLimiter::default()),
         fetch_limits: Arc::new(DashMap::new()),
         metrics: metrics_state,
@@ -274,10 +335,18 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_garbage_collector(state.clone());
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/ws", get(ws_handler))
+        .route("/sync/upsert", post(sync_upsert))
+        .route("/sync/:social_id", get(sync_get))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -360,6 +429,101 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| async move {
         handle_socket(socket, peer.ip(), conn_id, state).await;
     })
+}
+
+async fn sync_upsert(
+    State(state): State<AppState>,
+    Json(req): Json<SyncUpsertRequest>,
+) -> impl IntoResponse {
+    if req.social_id.trim().is_empty() || req.social_id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SyncUpsertResponse { ok: false }),
+        )
+            .into_response();
+    }
+    if req.account_blob_b64u.is_none() && req.contacts_blob_b64u.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SyncUpsertResponse { ok: false }),
+        )
+            .into_response();
+    }
+    if req
+        .account_blob_b64u
+        .as_ref()
+        .map(|v| v.len() > 2_000_000)
+        .unwrap_or(false)
+        || req
+            .contacts_blob_b64u
+            .as_ref()
+            .map(|v| v.len() > 2_000_000)
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(SyncUpsertResponse { ok: false }),
+        )
+            .into_response();
+    }
+
+    let now = now_epoch_seconds();
+    let mut set_doc = doc! {
+        "updated_at": now,
+    };
+    if let Some(v) = req.account_blob_b64u {
+        set_doc.insert("account_blob_b64u", v);
+    }
+    if let Some(v) = req.contacts_blob_b64u {
+        set_doc.insert("contacts_blob_b64u", v);
+    }
+
+    let filter = doc! { "social_id": req.social_id };
+    let update = doc! { "$set": set_doc };
+
+    match state
+        .sync_state
+        .update_one(filter, update, UpdateOptions::builder().upsert(true).build())
+        .await
+    {
+        Ok(_) => (StatusCode::OK, Json(SyncUpsertResponse { ok: true })).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SyncUpsertResponse { ok: false }),
+        )
+            .into_response(),
+    }
+}
+
+async fn sync_get(
+    State(state): State<AppState>,
+    Path(social_id): Path<String>,
+) -> impl IntoResponse {
+    if social_id.trim().is_empty() || social_id.len() > 128 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let filter = doc! { "social_id": social_id.clone() };
+    let doc = match state.sync_state.find_one(filter, None).await {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let Some(doc) = doc else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let resp = SyncGetResponse {
+        social_id,
+        account_blob_b64u: doc.get_str("account_blob_b64u").ok().map(|v| v.to_string()),
+        contacts_blob_b64u: doc
+            .get_str("contacts_blob_b64u")
+            .ok()
+            .map(|v| v.to_string()),
+        updated_at: doc.get_i64("updated_at").ok().unwrap_or_default(),
+    };
+
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, ip: IpAddr, conn_id: Uuid, state: AppState) {
