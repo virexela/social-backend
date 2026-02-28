@@ -50,7 +50,7 @@ async fn main() {
         )
         .init();
 
-    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3001".to_string());
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     let ws_rate_limit = read_usize_env("WS_RATE_LIMIT", 30);
     let ws_window_secs = read_u64_env("WS_WINDOW_SECS", 5);
     let http_rate_limit_per_window = read_usize_env("HTTP_RATE_LIMIT", 120);

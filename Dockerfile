@@ -20,7 +20,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /app/target/release/social-backend /app/social-backend
 
-ENV BIND_ADDR=0.0.0.0:3001
-EXPOSE 3001
+ENV BIND_ADDR=0.0.0.0:3000
+EXPOSE 3000
 
 CMD ["/app/social-backend"]

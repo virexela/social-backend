@@ -16,7 +16,7 @@ cargo build --release
 
 ## Environment Variables
 
-- `BIND_ADDR` (default `0.0.0.0:3001`)
+- `BIND_ADDR` (default `0.0.0.0:3000`)
 - `RUST_LOG` (default `info`)
 - `WS_RATE_LIMIT` / `WS_WINDOW_SECS`
 - `HTTP_RATE_LIMIT` / `HTTP_WINDOW_SECS`
@@ -41,5 +41,5 @@ cargo build --release
 
 ```bash
 docker build -t social-backend .
-docker run --rm -p 3001:3001 --env-file .env social-backend
+docker run --rm -p 3000:3000 --env-file .env social-backend
 ```
