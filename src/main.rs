@@ -273,12 +273,29 @@ async fn http_rate_limit(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
-    // peer SocketAddr is added by into_make_service_with_connect_info when the server is started
+    // Prefer proxy-provided client IP in hosted environments, fallback to peer socket address.
     let peer = req
-        .extensions()
-        .get::<SocketAddr>()
-        .map(|s| s.ip().to_string())
-        .unwrap_or_else(|| "unknown".into());
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            req.extensions()
+                .get::<SocketAddr>()
+                .map(|s| s.ip().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
     if !allow_http_request(&state, &peer).await {
         let body = serde_json::json!({ "error": "too_many_requests" }).to_string();
