@@ -64,27 +64,62 @@ async function allowHttpRequest(state, key) {
   return true;
 }
 
+// ✅ List of trusted proxy IP addresses/ranges
+// Only requests from these proxies can have their X-Forwarded-For header trusted
+const TRUSTED_PROXIES = [
+  '127.0.0.1',           // Localhost
+  '::1',                 // IPv6 localhost
+  /^10\./,               // Private IP range 10.0.0.0/8
+  /^172\.(1[6-9]|2\d|3[01])\./,  // Private IP range 172.16.0.0/12
+  /^192\.168\./,         // Private IP range 192.168.0.0/16
+  '::ffff:127.0.0.1',    // IPv6-mapped IPv4 localhost
+];
+
+function isTrustedProxy(ip) {
+  if (!ip) return false;
+  return TRUSTED_PROXIES.some(trusted => {
+    if (typeof trusted === 'string') {
+      return ip === trusted;
+    }
+    return trusted.test(ip);
+  });
+}
+
 function getClientIp(req) {
-  // Prefer x-forwarded-for from proxies, then x-real-ip, then socket address
-  const xForwardedFor = req.headers['x-forwarded-for'];
-  if (xForwardedFor) {
-    const ip = xForwardedFor.split(',')[0].trim();
-    if (ip) return ip;
+  const directIp = req.socket.remoteAddress || 'unknown';
+
+  // Only trust X-Forwarded-For if request came from a trusted proxy
+  if (!isTrustedProxy(directIp)) {
+    return directIp;
   }
 
+  // Request came from trusted proxy - now safe to read X-Forwarded-For
+  const xForwardedFor = req.headers['x-forwarded-for'];
+  if (xForwardedFor) {
+    // X-Forwarded-For can contain multiple IPs: client, proxy1, proxy2, ...
+    // The first IP in the list is the client's original IP
+    const ips = xForwardedFor.split(',').map(ip => ip.trim()).filter(Boolean);
+    if (ips.length > 0) return ips[0];
+  }
+
+  // Fallback to x-real-ip if X-Forwarded-For not available
   const xRealIp = req.headers['x-real-ip'];
   if (xRealIp) {
     const ip = xRealIp.trim();
     if (ip) return ip;
   }
 
-  return req.socket.remoteAddress || 'unknown';
+  return directIp;
 }
 
 async function handleHttpRateLimit(req, res, next) {
   const clientIp = getClientIp(req);
 
   if (!(await allowHttpRequest(req.app.locals.state, clientIp))) {
+    // ✅ NEW: Add rate limit response headers
+    res.set('RateLimit-Limit', req.app.locals.state.httpRateLimit.toString());
+    res.set('RateLimit-Remaining', '0');
+    res.set('RateLimit-Reset', (Date.now() + req.app.locals.state.httpWindowMs).toString());
     res.status(429).json({ error: 'too_many_requests' });
     return;
   }
@@ -268,7 +303,12 @@ async function inviteHandler(ws, room, state, query) {
   state.inviteRooms.set(room, roomMap);
 
   const requestedLimit = normalizeInviteLimit(query.limit);
-  const isCreator = isCreatorFlag(query.creator);
+  
+  // ✅ IMPROVED: Creator role only granted to first connection
+  // This prevents any subsequent connection from claiming creator status
+  const isFirstConnection = roomMap.size === 0;
+  const isCreatorClaim = isCreatorFlag(query.creator);
+  const isCreator = isFirstConnection && isCreatorClaim;
 
   if (isCreator || !state.inviteRoomLimits.has(room)) {
     state.inviteRoomLimits.set(room, requestedLimit);
@@ -288,7 +328,11 @@ async function inviteHandler(ws, room, state, query) {
   const connId = uuidv4();
   roomMap.set(connId, ws);
 
-  const notice = { type: 'invite_accepted', by: connId };
+  const notice = {
+    type: 'invite_accepted',
+    by: connId,
+    isCreator: isCreator,  // ✅ NEW: Communicate creator status
+  };
   for (const [key, client] of roomMap.entries()) {
     if (key !== connId && client.readyState === 1) {
       client.send(JSON.stringify(notice));
