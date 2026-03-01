@@ -1,10 +1,7 @@
-/target
-.env.local
-Cargo.lock
-
 # Environment files
 .env*
 !.env.example
+.env.local
 
 # Logs
 *.log
@@ -16,3 +13,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+/node_modules/
