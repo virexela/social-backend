@@ -2,24 +2,57 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  DEFAULT_INVITE_ROOM_LIMIT,
+  isCreatorFlag,
+  isValidRoom,
+  normalizeInviteLimit,
+  parseBindAddr,
+  readEnv,
+  validateServerConfig,
+  verifyWsJoinToken,
+} from './serverUtils.js';
 
-// Utility functions
-function readEnv(name, fallback) {
-  const value = process.env[name];
-  if (value === undefined) return fallback;
-  const parsed = parseInt(value, 10);
-  return !isNaN(parsed) && parsed > 0 ? parsed : fallback;
-}
+const RATE_LIMIT_REDIS_URL = process.env.RATE_LIMIT_REDIS_REST_URL?.trim();
+const RATE_LIMIT_REDIS_TOKEN = process.env.RATE_LIMIT_REDIS_REST_TOKEN?.trim();
+const WS_AUTH_SECRET = process.env.WS_AUTH_SECRET?.trim() ?? '';
+const WS_AUTH_ENFORCE = !!WS_AUTH_SECRET && (process.env.WS_AUTH_ENFORCE === '1' || process.env.NODE_ENV === 'production');
+validateServerConfig();
 
-function isValidRoom(room, maxLen) {
-  if (!room || room.length === 0 || room.length > maxLen) {
-    return false;
+async function getDistributedRateLimitCount(key, ttlSeconds) {
+  if (!RATE_LIMIT_REDIS_URL || !RATE_LIMIT_REDIS_TOKEN) return null;
+  const encodedKey = encodeURIComponent(`rl:backend:${key}`);
+  try {
+    const incrRes = await fetch(`${RATE_LIMIT_REDIS_URL}/incr/${encodedKey}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RATE_LIMIT_REDIS_TOKEN}` },
+    });
+    if (!incrRes.ok) return null;
+
+    const incrJson = await incrRes.json();
+    const count = Number(incrJson?.result ?? 0);
+    if (count === 1) {
+      await fetch(`${RATE_LIMIT_REDIS_URL}/expire/${encodedKey}/${Math.ceil(ttlSeconds)}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${RATE_LIMIT_REDIS_TOKEN}` },
+      });
+    }
+    return count;
+  } catch {
+    return null;
   }
-  return /^[a-zA-Z0-9\-_:]+$/.test(room);
 }
 
 // Rate limiting functions
 async function allowWsMessage(state, connId) {
+  const distributed = await getDistributedRateLimitCount(
+    `ws:${connId}`,
+    state.wsWindowMs / 1000
+  );
+  if (distributed !== null) {
+    return distributed <= state.wsRateLimit;
+  }
+
   const now = Date.now();
   const window = state.wsWindowMs;
 
@@ -43,6 +76,14 @@ async function allowWsMessage(state, connId) {
 }
 
 async function allowHttpRequest(state, key) {
+  const distributed = await getDistributedRateLimitCount(
+    `http:${key}`,
+    state.httpWindowMs / 1000
+  );
+  if (distributed !== null) {
+    return distributed <= state.httpRateLimit;
+  }
+
   const now = Date.now();
   const window = state.httpWindowMs;
 
@@ -128,8 +169,7 @@ async function handleHttpRateLimit(req, res, next) {
 }
 
 // Main server setup
-const bindAddr = process.env.BIND_ADDR || '0.0.0.0:8080';
-const [host, port] = bindAddr.split(':');
+const { host, port } = parseBindAddr(process.env.BIND_ADDR, '0.0.0.0:8080');
 
 const wsRateLimit = readEnv('WS_RATE_LIMIT', 30);
 const wsWindowSecs = readEnv('WS_WINDOW_SECS', 5);
@@ -164,14 +204,33 @@ app.use(handleHttpRateLimit);
 
 // Health check endpoint
 app.get('/healthz', (req, res) => {
+  if (req.query?.deep === '1') {
+    try {
+      validateServerConfig();
+      res.status(200).json({ ok: true, service: 'social-backend', checks: { securityConfig: 'ok' } });
+    } catch (err) {
+      res.status(503).json({
+        ok: false,
+        service: 'social-backend',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
   res.send('ok');
 });
 
 server.on('upgrade', (req, socket, head) => {
   const url = req.url;
+  const parsedUrl = new URL(url, `http://${req.headers.host}`);
+  const token = parsedUrl.searchParams.get('token') ?? undefined;
 
   if (url.startsWith('/ws/')) {
-    const room = url.slice(4);
+    const room = parsedUrl.pathname.slice(4);
+    if (WS_AUTH_ENFORCE && !verifyWsJoinToken({ token, room, scope: 'chat', secret: WS_AUTH_SECRET })) {
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       chatHandler(ws, room, state);
     });
@@ -179,7 +238,11 @@ server.on('upgrade', (req, socket, head) => {
     const match = url.match(/^\/invite-ws\/([^?]*)/);
     if (match) {
       const room = match[1];
-      const query = new URL(url, `http://${req.headers.host}`).searchParams;
+      if (WS_AUTH_ENFORCE && !verifyWsJoinToken({ token, room, scope: 'invite', secret: WS_AUTH_SECRET })) {
+        socket.destroy();
+        return;
+      }
+      const query = parsedUrl.searchParams;
       const inviteQuery = {
         limit: query.get('limit') ? parseInt(query.get('limit'), 10) : undefined,
         creator: query.get('creator'),
@@ -272,21 +335,6 @@ async function chatHandler(ws, room, state) {
   });
 }
 
-const DEFAULT_INVITE_ROOM_LIMIT = 2;
-const MAX_INVITE_ROOM_LIMIT = 50;
-
-function normalizeInviteLimit(limit) {
-  if (limit === undefined) return DEFAULT_INVITE_ROOM_LIMIT;
-  return Math.max(
-    DEFAULT_INVITE_ROOM_LIMIT,
-    Math.min(limit, MAX_INVITE_ROOM_LIMIT)
-  );
-}
-
-function isCreatorFlag(raw) {
-  return raw === '1' || raw === 'true' || raw === 'yes';
-}
-
 async function inviteHandler(ws, room, state, query) {
   if (!isValidRoom(room, state.maxRoomIdLen)) {
     ws.close(1008, 'invalid_room');
@@ -357,6 +405,6 @@ async function inviteHandler(ws, room, state, query) {
   });
 }
 
-server.listen(parseInt(port), host, () => {
+server.listen(port, host, () => {
   console.log(`listening on ${host}:${port}`);
 });

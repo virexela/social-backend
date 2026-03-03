@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/main.js",
     "dev": "node --watch src/main.js",
-    "test": "echo 'No backend tests configured yet'"
+    "test": "node --test"
   },
   "dependencies": {
     "ws": "^8.14.2",

@@ -32,12 +32,16 @@ All configuration is done via environment variables:
 - `MAX_WS_TEXT_LEN` (default: `1048576`) - Max WebSocket message size in bytes
 - `MAX_ROOM_CONNECTIONS` (default: `200`) - Max users per room
 - `MAX_ROOM_ID_LEN` (default: `128`) - Max room ID length
+- `RATE_LIMIT_REDIS_REST_URL` + `RATE_LIMIT_REDIS_REST_TOKEN` (optional) - Enable distributed rate limiting across instances
+- `WS_AUTH_SECRET` (optional) - HMAC secret for signed websocket join tokens
+- `WS_AUTH_ENFORCE` (`0`/`1`, default `0`) - Require valid ws token for `/ws/*` and `/invite-ws/*`
 
 ## API Endpoints
 
 ### HTTP
 
 - `GET /healthz` - Health check endpoint (returns "ok")
+- `GET /healthz?deep=1` - Deep check endpoint (validates security config, returns JSON)
 
 ### WebSocket
 
