@@ -221,15 +221,36 @@ app.get('/healthz', (req, res) => {
   res.send('ok');
 });
 
+function rejectUpgrade(req, socket, statusCode, statusText, body) {
+  if (!socket.writable) {
+    socket.destroy();
+    return;
+  }
+
+  const payload = `${body}\n`;
+  socket.write(
+    `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+    'Content-Type: text/plain; charset=utf-8\r\n' +
+    `Content-Length: ${Buffer.byteLength(payload)}\r\n` +
+    'Connection: close\r\n' +
+    '\r\n' +
+    payload
+  );
+  socket.destroy();
+
+  const clientIp = getClientIp(req);
+  console.warn(`[ws-upgrade] ${statusCode} ${statusText} ${req.url || '/'} ip=${clientIp}`);
+}
+
 server.on('upgrade', (req, socket, head) => {
-  const url = req.url;
-  const parsedUrl = new URL(url, `http://${req.headers.host}`);
+  const url = req.url || '/';
+  const parsedUrl = new URL(url, `http://${req.headers.host || 'localhost'}`);
   const token = parsedUrl.searchParams.get('token') ?? undefined;
 
   if (url.startsWith('/ws/')) {
     const room = parsedUrl.pathname.slice(4);
     if (WS_AUTH_ENFORCE && !verifyWsJoinToken({ token, room, scope: 'chat', secret: WS_AUTH_SECRET })) {
-      socket.destroy();
+      rejectUpgrade(req, socket, 401, 'Unauthorized', 'Invalid or missing websocket token');
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -240,7 +261,7 @@ server.on('upgrade', (req, socket, head) => {
     if (match) {
       const room = match[1];
       if (WS_AUTH_ENFORCE && !verifyWsJoinToken({ token, room, scope: 'invite', secret: WS_AUTH_SECRET })) {
-        socket.destroy();
+        rejectUpgrade(req, socket, 401, 'Unauthorized', 'Invalid or missing websocket token');
         return;
       }
       const query = parsedUrl.searchParams;
@@ -253,7 +274,7 @@ server.on('upgrade', (req, socket, head) => {
       });
     }
   } else {
-    socket.destroy();
+    rejectUpgrade(req, socket, 404, 'Not Found', 'WebSocket endpoint not found');
   }
 });
 

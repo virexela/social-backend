@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import WebSocket from 'ws';
+import { createWsJoinToken } from '../src/serverUtils.js';
 
 function pickPort() {
   return 20000 + Math.floor(Math.random() * 10000);
@@ -41,6 +42,31 @@ function waitForOpen(ws, timeoutMs = 5000) {
     ws.once('open', () => {
       clearTimeout(timer);
       resolve();
+    });
+    ws.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+function waitForUnexpectedResponse(ws, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timed out waiting for websocket rejection')), timeoutMs);
+    ws.once('unexpected-response', (req, res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        clearTimeout(timer);
+        resolve({ statusCode: res.statusCode, body });
+      });
+    });
+    ws.once('open', () => {
+      clearTimeout(timer);
+      reject(new Error('Expected websocket rejection but connection opened'));
     });
     ws.once('error', (err) => {
       clearTimeout(timer);
@@ -161,6 +187,66 @@ test('invite creator receives accepted state even when joining after peer', asyn
 
     peerWs.close();
     creatorWs.close();
+  } finally {
+    serverProc.kill('SIGTERM');
+  }
+});
+
+test('websocket upgrade returns 401 without a valid token in production', async (t) => {
+  if (!(await canBindLocalPort())) {
+    t.skip('Local socket bind is not permitted in this environment');
+    return;
+  }
+
+  const port = pickPort();
+  const secret = 'integration-secret';
+  const serverProc = spawn('node', ['src/main.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      WS_AUTH_SECRET: secret,
+      BIND_ADDR: `127.0.0.1:${port}`,
+      WS_RATE_LIMIT: '10',
+      WS_WINDOW_SECS: '60',
+      HTTP_RATE_LIMIT: '9999',
+      HTTP_WINDOW_SECS: '60',
+      RATE_LIMIT_REDIS_REST_URL: '',
+      RATE_LIMIT_REDIS_REST_TOKEN: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        serverProc.stdout.on('data', (chunk) => {
+          const text = String(chunk);
+          if (text.includes(`listening on 127.0.0.1:${port}`)) {
+            resolve();
+          }
+        });
+        serverProc.once('exit', (code) => reject(new Error(`Server exited early with code ${code}`)));
+      }),
+      sleep(5000).then(() => {
+        throw new Error('Server did not start in time');
+      }),
+    ]);
+
+    const rejectedWs = new WebSocket(`ws://127.0.0.1:${port}/ws/protected-room`);
+    const rejection = await waitForUnexpectedResponse(rejectedWs);
+    assert.equal(rejection.statusCode, 401);
+    assert.match(rejection.body, /Invalid or missing websocket token/);
+
+    const token = createWsJoinToken({
+      room: 'protected-room',
+      scope: 'chat',
+      secret,
+      ttlSeconds: 120,
+    });
+    const acceptedWs = new WebSocket(`ws://127.0.0.1:${port}/ws/protected-room?token=${token}`);
+    await waitForOpen(acceptedWs);
+    acceptedWs.close();
   } finally {
     serverProc.kill('SIGTERM');
   }
