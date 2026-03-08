@@ -183,6 +183,7 @@ const state = {
   chatRooms: new Map(),
   inviteRooms: new Map(),
   inviteRoomLimits: new Map(),
+  inviteRoomCreators: new Map(),
   wsRateLimit,
   wsWindowMs: wsWindowSecs * 1000,
   httpRateLimit,
@@ -351,12 +352,14 @@ async function inviteHandler(ws, room, state, query) {
   state.inviteRooms.set(room, roomMap);
 
   const requestedLimit = normalizeInviteLimit(query.limit);
-  
-  // ✅ IMPROVED: Creator role only granted to first connection
-  // This prevents any subsequent connection from claiming creator status
-  const isFirstConnection = roomMap.size === 0;
   const isCreatorClaim = isCreatorFlag(query.creator);
-  const isCreator = isFirstConnection && isCreatorClaim;
+  const currentCreatorConnId = state.inviteRoomCreators.get(room);
+  const hasActiveCreator = !!(currentCreatorConnId && roomMap.has(currentCreatorConnId));
+  const isCreator = isCreatorClaim && !hasActiveCreator;
+
+  if (isCreator) {
+    state.inviteRoomCreators.set(room, 'pending');
+  }
 
   if (isCreator || !state.inviteRoomLimits.has(room)) {
     state.inviteRoomLimits.set(room, requestedLimit);
@@ -374,12 +377,27 @@ async function inviteHandler(ws, room, state, query) {
   }
 
   const connId = uuidv4();
+  const existingConnIds = Array.from(roomMap.keys());
   roomMap.set(connId, ws);
+
+  if (isCreator) {
+    state.inviteRoomCreators.set(room, connId);
+  }
+
+  for (const existingConnId of existingConnIds) {
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'invite_accepted',
+        by: existingConnId,
+        isCreator: false,
+      }));
+    }
+  }
 
   const notice = {
     type: 'invite_accepted',
     by: connId,
-    isCreator: isCreator,  // ✅ NEW: Communicate creator status
+    isCreator: isCreator,
   };
   for (const [key, client] of roomMap.entries()) {
     if (key !== connId && client.readyState === 1) {
@@ -393,9 +411,13 @@ async function inviteHandler(ws, room, state, query) {
 
   ws.on('close', () => {
     roomMap.delete(connId);
+    if (state.inviteRoomCreators.get(room) === connId) {
+      state.inviteRoomCreators.delete(room);
+    }
     if (roomMap.size === 0) {
       state.inviteRooms.delete(room);
       state.inviteRoomLimits.delete(room);
+      state.inviteRoomCreators.delete(room);
     }
     console.log(`[invite-ws] connection ${connId} left room ${room}`);
   });

@@ -108,3 +108,60 @@ test('websocket relay and rate limiting work end-to-end', async (t) => {
     serverProc.kill('SIGTERM');
   }
 });
+
+test('invite creator receives accepted state even when joining after peer', async (t) => {
+  if (!(await canBindLocalPort())) {
+    t.skip('Local socket bind is not permitted in this environment');
+    return;
+  }
+
+  const port = pickPort();
+  const serverProc = spawn('node', ['src/main.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      BIND_ADDR: `127.0.0.1:${port}`,
+      WS_RATE_LIMIT: '10',
+      WS_WINDOW_SECS: '60',
+      HTTP_RATE_LIMIT: '9999',
+      HTTP_WINDOW_SECS: '60',
+      RATE_LIMIT_REDIS_REST_URL: '',
+      RATE_LIMIT_REDIS_REST_TOKEN: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        serverProc.stdout.on('data', (chunk) => {
+          const text = String(chunk);
+          if (text.includes(`listening on 127.0.0.1:${port}`)) {
+            resolve();
+          }
+        });
+        serverProc.once('exit', (code) => reject(new Error(`Server exited early with code ${code}`)));
+      }),
+      sleep(5000).then(() => {
+        throw new Error('Server did not start in time');
+      }),
+    ]);
+
+    const roomId = 'late-creator-room';
+    const peerWs = new WebSocket(`ws://127.0.0.1:${port}/invite-ws/${roomId}?limit=2`);
+    await waitForOpen(peerWs);
+
+    const creatorWs = new WebSocket(`ws://127.0.0.1:${port}/invite-ws/${roomId}?limit=2&creator=1`);
+    const creatorMessagePromise = waitForMessage(creatorWs);
+    await waitForOpen(creatorWs);
+
+    const creatorNotice = JSON.parse(await creatorMessagePromise);
+    assert.equal(creatorNotice.type, 'invite_accepted');
+    assert.ok(typeof creatorNotice.by === 'string' && creatorNotice.by.length > 0);
+
+    peerWs.close();
+    creatorWs.close();
+  } finally {
+    serverProc.kill('SIGTERM');
+  }
+});
